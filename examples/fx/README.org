@@ -53,7 +53,8 @@ Two shell integrations:
   =nil= when nothing is selected, so the handlers are =when-let= guarded.
 - *=:on-open=*: this example added the registry's optional =:on-open= hook —
   it runs on every open /and reopen/ of the example's window, so rates are
-  refreshed each time the window comes forward.
+  refreshed each time the window comes forward. (It has since grown a window
+  argument for the Particle Toy's timer lifecycle; this example ignores it.)
 
 The first parser, retired but kept (see the =:as :json= finding above) — the
 regex trade looked reasonable for one number, and lasted exactly one review:
@@ -206,5 +207,5 @@ regex trade looked reasonable for one number, and lasted exactly one review:
 
 (reg/register-example!
  {:id :fx :title "Live Currency" :view view :state state
-  :width 420 :height 210 :on-open fetch-rate!})
+  :width 420 :height 210 :on-open (fn [_window] (fetch-rate!))})
 #+end_src

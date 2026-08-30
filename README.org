@@ -200,7 +200,7 @@ conforms before any window exists).
 (s/def ::state some?)          ; a derefable state atom (no portable Atom class check)
 (s/def ::width pos-int?)
 (s/def ::height pos-int?)
-(s/def ::on-open fn?)   ; optional: runs on every open/reopen of the window
+(s/def ::on-open fn?)   ; optional: (fn [window-ptr]), runs on every open/reopen
 (s/def ::example (s/keys :req-un [::id ::title ::view ::state ::width ::height]
                          :opt-un [::on-open]))
 
@@ -785,17 +785,18 @@ its own watch on its own atom).
   (let [{:keys [title view state width height on-open] :as ex}
         (first (filter #(= id (:id %)) @reg/examples))]
     (when ex
-      (if-let [win (@example-windows id)]
+      (let [win (or (@example-windows id)
+                    (let [win (u/window-new title width height)]
+                      (u/objc-msg-send-1intvoid win (u/sel "setReleasedWhenClosed:") 0)
+                      (mount-second! win view state (keyword "demo.example" (name id)))
+                      (swap! example-windows assoc id win)
+                      (place-near-pointer! win)
+                      win))]
         (u/window-show! win)
-        (let [win (u/window-new title width height)]
-          (u/objc-msg-send-1intvoid win (u/sel "setReleasedWhenClosed:") 0)
-          (mount-second! win view state (keyword "demo.example" (name id)))
-          (swap! example-windows assoc id win)
-          (place-near-pointer! win)
-          (u/window-show! win)))
-      ;; :on-open runs on every open AND reopen — Live Currency uses it to
-      ;; fetch fresh rates each time its window comes forward.
-      (when on-open (on-open)))))
+        ;; :on-open runs on every open AND reopen, and receives the window
+        ;; pointer — Live Currency refetches rates; the Particle Toy starts
+        ;; its animation timer and uses the window to know when to stop.
+        (when on-open (on-open win))))))
 #+end_src
 
 Early versions centered every window — and since the hub centers too, each new
