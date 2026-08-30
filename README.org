@@ -70,7 +70,12 @@ The =tangle= task runs batch Emacs, which skips init files — hence the explici
  ;; README.org is the source of truth; `jolt tangle` regenerates this file and
  ;; src/ from it. Never edit the tangled files directly.
  :tasks {tangle "emacs --batch -l package --eval '(package-initialize)' -l org README.org -f org-babel-tangle"
-         demo   "jolt -M:demo"}}
+         demo   "jolt -M:demo"
+         ;; LaunchServices refuses script executables (see The -10669 saga);
+         ;; jolt build AOT-compiles the app into a self-contained Mach-O that
+         ;; IS the bundle executable (see The launcher dissolves).
+         bundle "mkdir -p Demo.app/Contents/MacOS && jolt build -m demo.core -o Demo.app/Contents/MacOS/demo && rm -rf Demo.app/Contents/MacOS/demo.build"
+         app    "open Demo.app"}}
 #+end_src
 
 * Namespace
@@ -207,8 +212,8 @@ separate problems hide in here:
    into it *before* =NSApplication= initializes makes AppKit read our name
    instead. (=NSString*= and =CFStringRef= are toll-free bridged, so
    =u/nsstring= works as a CF key/value.) This is a well-worn hack, not API —
-   if a macOS release stops honoring it, the real fix is wrapping the demo in
-   an actual =.app= bundle.
+   the real fix is a proper =Info.plist=, which the [[*Bundling a .app][Bundling a .app]] section
+   supplies; the hack stays so plain =jolt demo= runs get the right name too.
 2. *The menu's contents.* Fully supported — and menu items are a great fit for
    plain data, in the same spirit as hiccup. Each item is a map; =:separator=
    stands for itself. An item carries either an =:action= — an ObjC selector
@@ -227,6 +232,29 @@ separate problems hide in here:
      item whose selector nobody answers gets disabled for free. That's why the
      standard items "just work" and a typo'd selector shows up grayed out
      rather than crashing.
+
+The first cut hardcoded a single Quit item — kept here untangled, because it
+shows the raw shape (alloc/init, =addItem:=, =setSubmenu:=, =setMainMenu:=)
+before the data-driven version below abstracted it. Superseded, not wrong:
+
+#+begin_src clojure :tangle no
+(defn install-main-menu!
+  "Install a minimal main menu: the app menu with a ⌘Q quit item."
+  [app-name]
+  (let [menubar  (u/objc-msg-send-0 (u/cls "NSMenu") (u/sel "new"))
+        app-item (u/objc-msg-send-0 (u/cls "NSMenuItem") (u/sel "new"))
+        app-menu (u/objc-msg-send-1p (u/objc-msg-send-0 (u/cls "NSMenu") (u/sel "alloc"))
+                                     (u/sel "initWithTitle:") (u/nsstring app-name))
+        quit     (u/objc-msg-send-3p (u/objc-msg-send-0 (u/cls "NSMenuItem") (u/sel "alloc"))
+                                     (u/sel "initWithTitle:action:keyEquivalent:")
+                                     (u/nsstring (str "Quit " app-name))
+                                     (u/sel "terminate:")
+                                     (u/nsstring "q"))]
+    (u/objc-msg-send-1pvoid app-menu (u/sel "addItem:") quit)
+    (u/objc-msg-send-1pvoid app-item (u/sel "setSubmenu:") app-menu)
+    (u/objc-msg-send-1pvoid menubar (u/sel "addItem:") app-item)
+    (u/objc-msg-send-1pvoid (u/shared-application) (u/sel "setMainMenu:") menubar)))
+#+end_src
 
 #+begin_src clojure :tangle src/demo/core.clj :comments link
 ;; CoreFoundation bindings glitter-uikit.ffi doesn't carry.
@@ -346,3 +374,181 @@ re-reconciles the content view.
     :width 300
     :height 150))
 #+end_src
+
+* Bundling a .app
+
+A macOS app bundle is nothing but a folder convention — =Demo.app/Contents/=
+holding an =Info.plist= and an executable in =MacOS/=. Which means the whole
+bundle can be /tangled/ out of this document like everything else: =jolt
+tangle= *is* the build step, and =jolt app= (or double-clicking =Demo.app= in
+Finder) launches it.
+
+What the bundle buys us over =jolt demo=:
+
+- =CFBundleName= comes from =Info.plist= the supported way — the app menu says
+  "Demo" without the mutable-info-dictionary hack. (=set-app-name!= stays for
+  plain =jolt demo= runs; when launched from the bundle it just re-writes the
+  value the plist already supplied.)
+- A Dock name and LaunchServices identity (=CFBundleIdentifier=), Spotlight
+  visibility, and somewhere to hang an icon later (=Resources/= +
+  =CFBundleIconFile=).
+
+Three gotchas, all learned by the "why is my app a hollow shell" route:
+
+1. *LaunchServices launches with =cwd /= and launchd's minimal =PATH=* —
+   =/usr/bin:/bin:/usr/sbin:/sbin=, no Homebrew. The launcher fixes both:
+   prepend the Homebrew bin dirs, =cd= to the project root (found relative to
+   the script's own location — the bundle lives in the project root), then
+   =exec jolt= so the app process /is/ the jolt process.
+2. *No =:comments= on the plist block.* A breadcrumb comment would land before
+   the =<?xml?>= declaration, which must be the first bytes of the file —
+   org's link comments would quietly produce an invalid plist.
+3. *stdout goes to the unified log*, not a terminal — =println= output from a
+   Finder launch shows up in Console.app (or =log stream --process demo=), not
+   nowhere.
+
+A locally tangled bundle carries no quarantine attribute, so Gatekeeper leaves
+it alone; distributing it to anyone else is when codesigning/notarization
+enters the picture.
+
+#+begin_src xml :tangle Demo.app/Contents/Info.plist :mkdirp true
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>                  <string>Demo</string>
+  <key>CFBundleDisplayName</key>           <string>Demo</string>
+  <key>CFBundleIdentifier</key>            <string>dev.statonsoftware.demo</string>
+  <key>CFBundleExecutable</key>            <string>demo</string>
+  <key>CFBundlePackageType</key>           <string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key> <string>6.0</string>
+  <key>CFBundleShortVersionString</key>    <string>0.1.0</string>
+  <key>LSMinimumSystemVersion</key>        <string>12.0</string>
+  <key>NSHighResolutionCapable</key>       <true/>
+</dict>
+</plist>
+#+end_src
+
+The first launcher was a shell script — the =:shebang= header does double
+duty: org writes it as the first line *and* marks the tangled file executable.
+Kept untangled below, because it *doesn't work*, and finding out why was
+instructive:
+
+#+begin_src sh :tangle no :shebang #!/bin/sh
+# Launched by LaunchServices with cwd / and launchd's minimal PATH — neither
+# Homebrew's bin nor the project is in sight. Fix both, then exec jolt so the
+# app process IS the jolt process.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+cd "$(dirname "$0")/../../.." || exit 1
+exec jolt -M:demo
+#+end_src
+
+** The -10669 saga
+
+=jolt app= on the script-launcher bundle failed with:
+
+#+begin_example
+_LSOpenURLsWithCompletionHandler() failed with error -10669.
+#+end_example
+
+The script itself was fine — executing =Demo.app/Contents/MacOS/demo= directly
+launched the app. Only LaunchServices refused. The usual suspects all came up
+empty: no quarantine xattr, =plutil -lint= passed, =lsregister -f= didn't help,
+ad-hoc =codesign --deep -s -= didn't help. -10669 isn't even in the public
+headers — =LSConstants.h='s error enum stops at =-10667 // internal-error=.
+(Internet folklore blames Rosetta; a script has no architecture, so that
+explanation never fit.)
+
+What settled it was a controlled experiment: two bundles, identical
+=Info.plist=, differing only in the executable —
+
+#+begin_src sh :tangle no
+# MachoTest.app/Contents/MacOS/machotest: compiled from `int main(){return 0;}`
+# ScriptTest.app/Contents/MacOS/scripttest: `#!/bin/sh` + `exit 0`, chmod +x
+open MachoTest.app    # => opens, exit 0
+open ScriptTest.app   # => _LSOpenURLsWithCompletionHandler() failed with error -10669
+#+end_src
+
+Conclusion: *this macOS refuses to launch a bundle whose =CFBundleExecutable=
+is a script* — it wants a real Mach-O. (clang ad-hoc signs automatically on
+Apple Silicon, which the experiment shows is sufficient; no Developer ID
+needed for local launches.)
+
+So the launcher is now ten lines of C doing exactly what the script did:
+resolve its own location, =chdir= to the project root, fix =PATH=, =exec=
+jolt. One nuance: after the =exec=, the process's executable is =jolt=, so
+in-process =CFBundleGetMainBundle= no longer points at =Demo.app= — LaunchServices
+keeps the Dock identity (it tracks the process, surviving the exec), and
+=set-app-name!= keeps the menu title right. The hack earns its keep after all.
+
+#+begin_src C :tangle no
+#include <limits.h>
+#include <libgen.h>
+#include <mach-o/dyld.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main(void) {
+  /* Resolve our own real path: <root>/Demo.app/Contents/MacOS/demo */
+  char exe[PATH_MAX];
+  uint32_t size = sizeof(exe);
+  if (_NSGetExecutablePath(exe, &size) != 0) return 1;
+  char real[PATH_MAX];
+  if (realpath(exe, real) == NULL) return 1;
+
+  /* The project root is three directories above MacOS/ */
+  char root[PATH_MAX];
+  snprintf(root, sizeof(root), "%s/../../..", dirname(real));
+  if (chdir(root) != 0) { perror("chdir"); return 1; }
+
+  /* LaunchServices' PATH has no Homebrew */
+  setenv("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", 1);
+  execlp("jolt", "jolt", "-M:demo", (char *)NULL);
+  perror("exec jolt"); /* only reached on failure */
+  return 1;
+}
+#+end_src
+
+Compiling is one =clang= line, so it lived as the =bundle= task (jolt runs
+string tasks through the shell, so =&&= works). The full loop:
+
+#+begin_example
+jolt tangle && jolt bundle && jolt app
+#+end_example
+
+** The launcher dissolves
+
+The C shim lasted one session. The thought that killed it: jolt runs on Chez
+Scheme, so couldn't the launcher be written in jolt? (Half-correction along
+the way: Chez does *not* compile via C — it's a direct native-code compiler,
+which is why jolt starts fast. The only C in the picture is Chez's kernel,
+=libkernel.a=, which =jolt build= links against.)
+
+Better than a launcher written in jolt: *no launcher*. =jolt build=
+ahead-of-time compiles the whole project — runtime, stdlib, deps, app — into
+one self-contained Mach-O, and that binary can simply /be/
+=CFBundleExecutable=:
+
+#+begin_example
+jolt build -m demo.core -o Demo.app/Contents/MacOS/demo
+#+end_example
+
+Everything the shim existed to do dissolves:
+
+- *PATH fixing* — nothing to =exec=; there is no dependency on finding =jolt=.
+- *=chdir= to the project root* — deps are compiled in; nothing is read from
+  the project at runtime.
+- *The exec identity split* — the process's executable now IS the bundle's, so
+  =CFBundleGetMainBundle= points at =Demo.app= and =Info.plist='s
+  =CFBundleName= titles the app menu the fully supported way.
+  =set-app-name!= is finally redundant when bundled (still earning its keep
+  for =jolt demo= dev runs).
+- And LaunchServices is satisfied, because the executable is a real Mach-O —
+  the thing the whole -10669 saga was about.
+
+The trade: the binary is a snapshot, so the =bundle= task reruns the build
+(=jolt demo= remains the live path for development). The launcher.c block
+above is untangled but kept — it documents why the executable must be Mach-O,
+and ten lines of =_NSGetExecutablePath= / =chdir= / =execlp= is the shape of
+the fallback if a bundle ever needs to launch something it can't link in.
