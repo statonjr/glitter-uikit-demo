@@ -25,9 +25,10 @@ in =demo.core=.
 (defonce state (atom {:count 0}))
 
 (defn view [{:keys [count]}]
-  [:vbox {:spacing 12}
-   [:label {:label (str "Count: " count)}]
-   [:hbox {:spacing 8}
+  [:vbox {:spacing 12 :margin 16}
+   [:label {:markup [:span {:size "small" :foreground "#8e939d"} "COUNT"]}]
+   [:label {:markup [:span {:size "xx-large" :weight "bold"} (str count)]}]
+   [:hbox {:spacing 8 :homogeneous true}
     [:button {:label "+ 1" :on {:click [[:action/inc]]}}]
     [:button {:label "Reset" :on {:click [[:action/reset]]}}]
     [:button {:label "- 1" :on {:click [[:action/dec]]}}]]])
@@ -42,5 +43,5 @@ in =demo.core=.
 
 (reg/register-example!
  {:id :counter :title "Counter" :view view :state state
-  :width 300 :height 150})
+  :width 300 :height 170})
 #+end_src

@@ -84,7 +84,8 @@ app-wide, so example notebooks keep their kinds collision-free by convention.
                                 (if (< c 10) (str "0" c) c)))))
 
 (defn view [{:keys [amount]}]
-  [:vbox {:spacing 10}
+  [:vbox {:spacing 10 :margin 16}
+   [:label {:markup [:span {:size "large" :weight "bold"} "Currency Converter"]}]
    [:hbox {:spacing 8}
     [:label {:label "Exchange Rate per $1:"}]
     [:entry {:width-request 120 :on {:change [[:action.currency/set-rate]]}}]]
@@ -95,7 +96,7 @@ app-wide, so example notebooks keep their kinds collision-free by convention.
     [:label {:label "Amount in Other Currency:"}]
     ;; The book uses a non-editable text field; a label is the honest
     ;; equivalent here (no :editable prop on :entry in the v1 widget set).
-    [:label {:label (if amount (fmt-2dp amount) "--")}]]
+    [:label {:markup [:span {:weight "bold"} (if amount (fmt-2dp amount) "--")]}]]
    [:button {:label "Convert" :on {:click [[:action.currency/convert]]}}]])
 
 (defmethod reg/action-spec :action.currency/set-rate [_]
@@ -119,5 +120,5 @@ app-wide, so example notebooks keep their kinds collision-free by convention.
 
 (reg/register-example!
  {:id :currency :title "Currency Converter" :view view :state state
-  :width 380 :height 190})
+  :width 400 :height 230})
 #+end_src
