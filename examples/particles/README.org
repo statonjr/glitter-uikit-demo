@@ -1,0 +1,50 @@
+#+title: Particle Toy
+#+author: Larry Staton
+
+* Particle Toy
+
+A stub, deliberately — registered and openable from the hub, with the design
+parked here until we build it.
+
+** The plan
+
+Recon on upstream ([[https://github.com/burinc/glitter-uikit/blob/main/src/glitter_uikit/widget.clj][=glitter-uikit.widget=]]'s =canvas-spec=; see also Apple's
+[[https://developer.apple.com/documentation/quartzcore/calayer][CALayer]] docs and upstream's [[https://github.com/burinc/glitter-uikit/blob/main/examples/glitter_uikit/circles.clj][circles example]] — 7GUIs' [[https://eugenkiss.github.io/7guis/tasks/#circle][Circle Drawer]], the
+=:canvas= widget's original client) settled the approach before any code:
+
+- =:canvas= is an =NSButton= hosting *CALayer* circles driven by a =:circles=
+  data prop. Layers is the load-bearing choice upstream: a =CALayer= takes no
+  part in hit-testing, so clicks always land on the canvas — sub-views would
+  swallow them.
+- Animation: =w/every!= wraps =NSTimer= scheduled on the main run loop, so the
+  tick can =swap!= particle positions directly and the reconciler syncs the
+  layers. Physics is pure Clojure over =[{:x :y :vx :vy} ...]= — spec it,
+  like everything else.
+- Timer lifecycle is the real design work: start on first open, and stop
+  (=w/cancel-every!=) when the window closes — needs window-close awareness
+  the shell doesn't have yet (an =NSWindowDelegate= =windowWillClose:=, or
+  polling =isVisible= from the tick).
+- If layer diffing chokes at particle counts worth having,
+  =w/register-widget!= is public — a custom particle widget is the escape
+  hatch. And an immediate-mode rlgl/raylib canvas
+  ([[https://jlt-commons.github.io/raylib-jlt/][raylib-jlt]]) is the escape hatch beyond that — though raylib owns its own
+  event loop, so it likely wants its own window/process rather than living
+  inside the NSApp run loop.
+
+** The stub
+
+#+begin_src clojure :tangle ../../src/demo/examples/particles.clj :mkdirp true :comments link
+(ns demo.examples.particles
+  (:require [demo.registry :as reg]))
+
+(defonce state (atom {}))
+
+(defn view [_]
+  [:vbox {:spacing 10}
+   [:label {:label "Particle toy: not yet."}]
+   [:label {:label "See examples/particles/README.org for the plan."}]])
+
+(reg/register-example!
+ {:id :particles :title "Particle Toy" :view view :state state
+  :width 320 :height 120})
+#+end_src

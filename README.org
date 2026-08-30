@@ -34,6 +34,27 @@ jolt tangle   # regenerate deps.edn and src/ from this file
 jolt demo     # run the app
 #+end_example
 
+The project is a set of literate notebooks, not one. This top-level file owns
+the toolchain (=Brewfile=, =deps.edn=), the app shell (menu bar, preferences,
+=.app= bundling), and the *hub* — a main window listing every example as a
+button, each opening in its own window. Each example is its own notebook,
+tangling its own namespace:
+
+#+begin_example
+README.org                     → Brewfile, deps.edn, src/demo/registry.clj, src/demo/core.clj
+examples/counter/README.org    → src/demo/examples/counter.clj
+examples/currency/README.org   → src/demo/examples/currency.clj
+examples/particles/README.org  → src/demo/examples/particles.clj
+#+end_example
+
+Per-directory =README.org= means GitHub renders every example's page in place.
+One org-mode landmine made this shape necessary: =#+INCLUDE:= is /export/-only
+— =org-babel-tangle= does not follow it — so a single README including
+children could never tangle them. Instead the =tangle= task finds and tangles
+every notebook; =:tangle= paths are relative to each org file, so examples
+write into the shared =src/= tree with =../../src/...= paths and a single
+=:paths ["src"]= serves everything.
+
 *Never edit the tangled files directly* — the next tangle clobbers them (ask me
 how I know). The blocks use =:comments link=, so each tangled file carries
 breadcrumbs back to its source section here, and =org-babel-detangle= can flow
@@ -79,7 +100,7 @@ The =tangle= task runs batch Emacs, which skips init files — hence the explici
 
  ;; README.org is the source of truth; `jolt tangle` regenerates this file and
  ;; src/ from it. Never edit the tangled files directly.
- :tasks {tangle "emacs --batch -l package --eval '(package-initialize)' -l org README.org -f org-babel-tangle"
+ :tasks {tangle "find . -name README.org -not -path './Demo.app/*' | xargs -I{} emacs --batch -l package --eval '(package-initialize)' -l org {} -f org-babel-tangle"
          demo   "jolt -M:demo"
          ;; LaunchServices refuses script executables (see The -10669 saga);
          ;; jolt build AOT-compiles the app into a self-contained Mach-O that
@@ -100,9 +121,17 @@ glitter itself. =jolt.ffi= is Jolt's own FFI layer, required directly so the
 menu-bar section below can bind a few CoreFoundation functions that
 =glitter-uikit.ffi= doesn't wrap.
 
+The =demo.registry= require is the seam the multi-notebook structure turns on
+(next section); the =demo.examples.*= requires are how examples join the hub —
+adding an example to the app is adding one line here.
+
 #+begin_src clojure :tangle src/demo/core.clj :mkdirp true :comments link
 (ns demo.core
     (:require [clojure.spec.alpha :as s]
+              [demo.registry :as reg]
+              [demo.examples.counter]
+              [demo.examples.currency]
+              [demo.examples.particles]
               [glitter-uikit.app :as app]
               [glitter-uikit.appkit :as appkit]
               [glitter-uikit.ffi :as u]
@@ -110,6 +139,89 @@ menu-bar section below can bind a few CoreFoundation functions that
               [glitter.alias :as alias]
               [glitter.core :as core]
               [jolt.ffi :as ffi]))
+#+end_src
+
+* The registry
+
+Examples must register themselves with the hub, and the dispatcher must accept
+action kinds it has never heard of — both are /open/ seams, and both live in
+their own small namespace so example notebooks can require it without
+circularity (=demo.core= requires the examples; the examples require only
+=demo.registry=).
+
+Two pieces of open machinery, mirrored:
+
+- =run-action!= is a *multimethod* on the action's kind — each notebook
+  =defmethod=​s its own actions next to the feature they serve.
+- =action-spec= is a multimethod returning the /spec/ for each kind, knitted
+  into one open spec with =s/multi-spec= — so validation stays ahead of every
+  FFI call (the running theme), yet each notebook extends it independently. An
+  unknown kind has no method and is invalid: typos still get caught.
+
+The dispatcher keeps the two failure policies established earlier: /warn/ on an
+invalid batch mid-interaction, /throw/ at registration time (=register-example!=
+conforms before any window exists).
+
+#+begin_src clojure :tangle src/demo/registry.clj :mkdirp true :comments link
+(ns demo.registry
+  "Open seams: the example registry and the extensible action dispatcher.
+  Example notebooks require this namespace only — never demo.core."
+  (:require [clojure.spec.alpha :as s]
+            [glitter.core :as core]))
+
+;; --- the example registry ----------------------------------------------------
+(s/def ::id keyword?)
+(s/def ::title string?)
+(s/def ::view fn?)
+(s/def ::state some?)          ; a derefable state atom (no portable Atom class check)
+(s/def ::width pos-int?)
+(s/def ::height pos-int?)
+(s/def ::example (s/keys :req-un [::id ::title ::view ::state ::width ::height]))
+
+(defonce examples (atom []))
+
+(defn register-example!
+  "Add (or replace, by :id) an example. Conforms before anything is built."
+  [ex]
+  (when-not (s/valid? ::example ex)
+    (throw (ex-info (str "Invalid example: " (s/explain-str ::example ex))
+                    {:example ex})))
+  (swap! examples (fn [xs] (conj (vec (remove #(= (:id %) (:id ex)) xs)) ex)))
+  nil)
+
+;; --- the open action pipeline ------------------------------------------------
+(defmulti action-spec
+  "Spec for one action vector, dispatched on its kind. Each notebook
+  defmethods its own kinds; no method means invalid — typos stay loud."
+  first)
+
+(s/def ::action (s/multi-spec action-spec (fn [g _] g)))
+(s/def ::actions (s/coll-of ::action))
+
+(defn event-value
+  "The value carried by an event — an entry's text, a checkbox state, a
+  drop-down index. The renderer puts :glitter/value in its RAW event map, but
+  glitter.core/build-event-map nests that whole map under :glitter/dom-event
+  (lifting only :glitter/node), so the value is one level down from where
+  you'd look first. Upstream's temperature.clj documents the same finding and
+  resolves it with an identical get-in in its nexus placeholder."
+  [event]
+  (get-in event [:glitter/dom-event :glitter/value]))
+
+(defmulti run-action!
+  "Interpret one action vector. `event` is glitter's wrapped event map —
+  read values with `event-value`, not (:glitter/value event)."
+  (fn [_event action] (first action)))
+
+(defmethod run-action! :default [_ action]
+  (println "Unhandled action:" (pr-str action)))
+
+(defn execute-actions [event actions]
+  (when-not (s/valid? ::actions actions)
+    (println "Invalid actions:" (s/explain-str ::actions actions)))
+  (doseq [a actions] (run-action! event a)))
+
+(core/set-dispatch! execute-actions)
 #+end_src
 
 * State
@@ -123,8 +235,13 @@ included).
 =[r g b a]= vector, =nil= meaning "system default". Plain data, so it specs,
 prints, and diffs like everything else.
 
+=:count= used to live here too — it moved out with the counter to
+[[file:examples/counter/README.org][its own notebook]] when the main window became the hub. App-level state and
+example state are separate atoms on purpose: examples can't trample each other
+or the shell.
+
 #+begin_src clojure :tangle src/demo/core.clj :comments link
-(defonce state (atom {:count 0 :bg nil}))
+(defonce state (atom {:bg nil}))
 #+end_src
 
 * View
@@ -134,7 +251,10 @@ A pure =state -> hiccup= function. =:vbox= / =:hbox= are literally
 =NSTextField= label. Everything you know about stack view behavior applies,
 because that's what these are.
 
-#+begin_src clojure :tangle src/demo/core.clj :comments link
+The original main-window view was the counter — kept below untangled; it lives
+on, nearly verbatim, in [[file:examples/counter/README.org][examples/counter]]:
+
+#+begin_src clojure :tangle no
 (defn view [{:keys [count]}]
   [:vbox {:spacing 12}
    [:label {:label (str "Count: " count)}]
@@ -142,6 +262,19 @@ because that's what these are.
     [:button {:label "+ 1" :on {:click [[:action/inc]]}}]
     [:button {:label "Reset" :on {:click [[:action/reset]]}}]
     [:button {:label "- 1" :on {:click [[:action/dec]]}}]]])
+#+end_src
+
+The main window is now the *hub*: one button per registered example, derived
+from the registry. The registry is populated at require time (the
+=demo.examples.*= lines in the ns form), so it's complete before the first
+render.
+
+#+begin_src clojure :tangle src/demo/core.clj :comments link
+(defn hub-view [_state]
+  (into [:vbox {:spacing 8}
+         [:label {:label "glitter-uikit examples"}]]
+        (for [{:keys [id title]} @reg/examples]
+          [:button {:label title :on {:click [[:action/open-example id]]}}])))
 #+end_src
 
 * Actions
@@ -163,7 +296,14 @@ preferences flow (=:action/pick-bg= opens the color panel; the panel's own
 changes come back through =:action/set-bg=) — =declare='d here, defined in the
 Preferences section.
 
-#+begin_src clojure :tangle src/demo/core.clj :comments link
+The closed =case= dispatcher below served until the app grew multiple example
+notebooks — a =case= (and a closed =s/or=) can't learn kinds it has never seen,
+so both were superseded by =demo.registry='s multimethod pair (=run-action!= +
+=action-spec= under =s/multi-spec=). Kept untangled; the shape is worth
+remembering because every closed dispatcher looks this reasonable right before
+it can't grow:
+
+#+begin_src clojure :tangle no
 (declare open-color-panel!)
 
 (s/def ::rgba (s/coll-of number? :count 4))
@@ -187,6 +327,10 @@ Preferences section.
 
 (core/set-dispatch! execute-actions)
 #+end_src
+
+Actions now live beside the features they serve: the counter's in its
+notebook, the hub's =:action/open-example= in the Opening-examples section,
+the preferences pair next to the color panel.
 
 * Toolbar experiments
 
@@ -448,18 +592,51 @@ directly.
     (swap! w/actions assoc-in [panel :click]
            (fn [sender]
              (when-let [rgba (nscolor->rgba (u/objc-msg-send-0 sender (u/sel "color")))]
-               (execute-actions nil [[:action/set-bg rgba]]))))
+               (reg/execute-actions nil [[:action/set-bg rgba]]))))
     (u/objc-msg-send-1intvoid panel (u/sel "setContinuous:") 1)
     (u/objc-msg-send-1pvoid panel (u/sel "setTarget:") w/invoker)
     (u/objc-msg-send-1pvoid panel (u/sel "setAction:") (u/sel "fire:"))
     (u/objc-msg-send-1pvoid panel (u/sel "makeKeyAndOrderFront:") ffi/null)))
 #+end_src
 
+The preferences actions, registered into the open pipeline — the first
+demonstration of actions living beside their feature instead of in a central
+=case=:
+
+#+begin_src clojure :tangle src/demo/core.clj :comments link
+(s/def ::rgba (s/coll-of number? :count 4))
+
+(defmethod reg/action-spec :action/pick-bg [_]
+  (s/cat :kind #{:action/pick-bg}))
+(defmethod reg/action-spec :action/set-bg [_]
+  (s/cat :kind #{:action/set-bg} :color ::rgba))
+
+(defmethod reg/run-action! :action/pick-bg [_ _] (open-color-panel!))
+(defmethod reg/run-action! :action/set-bg [_ [_ rgba]]
+  (swap! state assoc :bg rgba))
+#+end_src
+
 The window itself: created lazily once, then reused. Two AppKit details —
 =setReleasedWhenClosed:NO=, because a titled NSWindow defaults to
-self-releasing on close and our cached pointer would dangle on reopen; and the
-prefs view is ordinary hiccup on the SAME state atom, so the swatch label
-re-renders live as the panel drags.
+self-releasing on close and our cached pointer would dangle on reopen (it
+turns out =u/window-new= already sets this itself — the explicit call is
+belt-and-suspenders); and the prefs view is ordinary hiccup on the SAME state
+atom, so the swatch label re-renders live as the panel drags.
+
+Placement: this window originally =window-center!='d itself — straight onto
+the equally-centered main window, an eclipse waiting for a stray click. The
+fix (see the Opening-examples section for the FFI constraint that shaped it)
+is to open at the pointer instead:
+
+#+begin_src clojure :tangle src/demo/core.clj :comments link
+(defn- place-near-pointer!
+  "Put `win`'s top-left just below-right of the current pointer position —
+  where the user's attention already is. NSPoint arg = two flattened doubles."
+  [win]
+  (let [[mx my] (u/mouse-location)]
+    (u/objc-msg-send-2dvoid win (u/sel "setFrameTopLeftPoint:")
+                            (+ mx 24.0) (- my 16.0))))
+#+end_src
 
 #+begin_src clojure :tangle src/demo/core.clj :comments link
 (defonce ^:private prefs-window (atom nil))
@@ -478,7 +655,7 @@ re-renders live as the panel drags.
       (u/objc-msg-send-1intvoid win (u/sel "setReleasedWhenClosed:") 0)
       (mount-second! win prefs-view state ::prefs-render)
       (reset! prefs-window win)
-      (u/window-center! win)
+      (place-near-pointer! win)
       (u/window-show! win))))
 #+end_src
 
@@ -518,8 +695,9 @@ digraph dataflow {
   subgraph cluster_views {
     label="hiccup views (reconciled)";
     style=dashed;
-    main  [label="counter view\n(main window)"];
+    main  [label="hub view\n(main window)"];
     prefs [label="prefs-view\n(Preferences window)"];
+    ex    [label="example views\n(one window each)"];
   }
 
   subgraph cluster_chrome {
@@ -534,7 +712,8 @@ digraph dataflow {
   state    [label="state\n{:count n, :bg [r g b a]}", shape=ellipse, style=bold];
 
   // data in: every mutation is an action vector
-  main  -> dispatch [label="[[:action/inc]] etc."];
+  main  -> dispatch [label="[[:action/open-example id]]"];
+  ex    -> dispatch [label="[[:action/inc]] etc."];
   prefs -> dispatch [label="[[:action/pick-bg]]"];
   panel -> dispatch [label="[[:action/set-bg [r g b a]]]"];
 
@@ -547,10 +726,51 @@ digraph dataflow {
   state -> main  [label="::render"];
   state -> prefs [label="::prefs-render"];
   state -> bg    [label="::apply-bg"];
+  state -> ex    [label="::demo.example/<id>\n(per-example atoms)", style=dotted];
 }
 #+end_src
 
 [[file:dataflow.svg]]
+
+* Opening examples
+
+The Preferences window's machinery, generalized: each example opens in its own
+window — created lazily, cached by id, =setReleasedWhenClosed:NO= so the
+cached pointer survives a close, =mount-second!= with a *per-example watch
+key* (the watch-key lesson, now load-bearing: every open example window holds
+its own watch on its own atom).
+
+#+begin_src clojure :tangle src/demo/core.clj :comments link
+(defonce ^:private example-windows (atom {}))
+
+(defmethod reg/action-spec :action/open-example [_]
+  (s/cat :kind #{:action/open-example} :id keyword?))
+
+(defmethod reg/run-action! :action/open-example [_ [_ id]]
+  (if-let [win (@example-windows id)]
+    (u/window-show! win)
+    (when-let [{:keys [title view state width height]}
+               (first (filter #(= id (:id %)) @reg/examples))]
+      (let [win (u/window-new title width height)]
+        (u/objc-msg-send-1intvoid win (u/sel "setReleasedWhenClosed:") 0)
+        (mount-second! win view state (keyword "demo.example" (name id)))
+        (swap! example-windows assoc id win)
+        (place-near-pointer! win)
+        (u/window-show! win)))))
+#+end_src
+
+Early versions centered every window — and since the hub centers too, each new
+window opened as a near-perfect eclipse of it, easily lost behind a stray
+click. The obvious fix, reading the hub's frame and cascading from it, hit an
+FFI wall: the binding layer can return an =NSPoint= (via =u/mouse-location='s
+out-buffer) but has *no NSRect reader*, so a window's frame is unreadable from
+here. The constraint chose a better design: open the window at the pointer —
+[[https://developer.apple.com/documentation/appkit/nswindow/setframetopleftpoint(_:)][=setFrameTopLeftPoint:=]] is an =NSPoint= arg, which flattens to the two-double
+=objc-msg-send-2dvoid= shape per the HFA rule, and the pointer is exactly
+where the user's attention already is. (AppKit constrains a frame that would
+land offscreen when the window is shown, so an edge-of-screen click is safe.)
+=place-near-pointer!= is defined back in the Preferences section — that
+window had the same problem first.
 
 * Main
 
@@ -572,10 +792,10 @@ re-reconciles the content view.
       (u/objc-msg-send-1intvoid window (u/sel "setTitlebarAppearsTransparent:") 1)
       ;; (add-titlebar-button! window "Reset" (fn [] (reset! state {:count 0})))
       (watch-background! window state)
-      (appkit/mount! window view state))
+      (appkit/mount! window hub-view state))
     :title "Demo"
     :width 300
-    :height 150))
+    :height 220))
 #+end_src
 
 * Bundling a .app
@@ -755,3 +975,48 @@ The trade: the binary is a snapshot, so the =bundle= task reruns the build
 above is untangled but kept — it documents why the executable must be Mach-O,
 and ten lines of =_NSGetExecutablePath= / =chdir= / =execlp= is the shape of
 the fallback if a bundle ever needs to launch something it can't link in.
+
+* References
+
+The lineage and the sources this notebook leans on — kept here so readers can
+follow the same trail.
+
+*The stack*
+
+- [[https://github.com/jolt-lang/jolt][jolt]] — native Clojure on Chez Scheme; [[https://jolt-lang.github.io/docs/building-and-deps.html][Building & Running]] covers
+  =jolt build='s AOT compilation (how our =.app= executable is made).
+- [[https://github.com/burinc/glitter][glitter]] — the Replicant-style reconciler; owns =glitter.core= and the
+  IRender/IMemory renderer seam.
+- [[https://github.com/burinc/glitter-uikit][glitter-uikit]] — the AppKit renderer this demo drives. Its
+  [[https://github.com/burinc/glitter-uikit/blob/main/src/glitter_uikit/ffi.clj][ffi.clj]] docstring is the best short course on calling =objc_msgSend= from
+  a C FFI (fixed-arity bindings, structs flattened per the arm64 HFA rule).
+
+*The ideas*
+
+- [[https://replicant.fun][Replicant]] — the data-driven rendering lineage (state atom, hiccup, pure
+  views) this whole app follows; [[https://github.com/cjohansen/nexus][Nexus]] is its actions-as-data dispatch
+  library, which glitter ships as =glitter.nexus= — the ecosystem-native
+  alternative to our =demo.registry= multimethods, and a worthy future port.
+- [[https://eugenkiss.github.io/7guis/][7GUIs]] — the GUI-benchmark tasks upstream's examples implement; our
+  Currency Converter is a cousin of its Temperature Converter.
+- [[https://leanpub.com/fp-oo][Brian Marick, /Functional Programming for the Object-Oriented Programmer/]]
+  — the spirit of the Currency Converter port: familiar OO ceremony,
+  re-expressed until it dissolves.
+- [[http://www.literateprogramming.com/knuthweb.pdf][Knuth, /Literate Programming/ (1984)]] — why this file is the program.
+
+*The platform*
+
+- [[https://developer.apple.com/documentation/appkit][AppKit documentation]] — notably [[https://developer.apple.com/documentation/appkit/nscolorpanel][NSColorPanel]],
+  [[https://developer.apple.com/documentation/appkit/nstitlebaraccessoryviewcontroller][NSTitlebarAccessoryViewController]], [[https://developer.apple.com/documentation/appkit/nsmenu][NSMenu]], and [[https://developer.apple.com/documentation/appkit/nswindow][NSWindow]].
+- [[https://developer.apple.com/documentation/coreservices/launch_services][Launch Services]] — the -10669 saga's home turf; the public error enum lives
+  in =LSConstants.h= (and stops before -10669).
+- [[https://www.oreilly.com/library/view/learning-cocoa/0596001606/ch07.html][/Learning Cocoa/, ch. 7]] (O'Reilly, 2001) — the original Currency
+  Converter.
+
+*The tooling*
+
+- [[https://orgmode.org/manual/Extracting-Source-Code.html][Org manual: Extracting Source Code]] — tangling, =:comments link=,
+  =org-babel-detangle=.
+- [[https://docs.brew.sh/Brewfile-and-brew-bundle][Homebrew Bundle]] — the Brewfile format.
+- [[https://jlt-commons.github.io/raylib-jlt/][raylib-jlt]] — direct jolt-FFI raylib bindings; the particle toy's escape
+  hatch.
