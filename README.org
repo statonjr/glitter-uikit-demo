@@ -9,6 +9,12 @@ A literate demo of [[https://github.com/burinc/glitter-uikit][glitter-uikit]] �
 model, if you come from the web: glitter is the reconciler, AppKit is the DOM.
 Hiccup in, real =NSButton=​s out.
 
+#+caption: The hub and every example, live — all tangled from this document.
+[[file:media/examples.png]]
+
+(There's a [[file:media/live-fx.mov][screen recording]] of Live Currency fetching real ECB rates as the
+currencies change, and a [[*Gallery][gallery]] of the individual windows below.)
+
 The toolchain installs from a Brewfile — tangled from this document, of
 course — with =brew bundle --file=./Brewfile= (explicit on purpose: anyone
 with =HOMEBREW_BUNDLE_FILE= pointing at a global Brewfile would otherwise
@@ -20,6 +26,7 @@ brew "jolt-lang/jolt/jolt"   # the jolt runtime/compiler
 brew "gtk4"                  # required transitively by glitter's :jolt/native (see Dependencies)
 brew "emacs"                 # tangles this document
 brew "graphviz"              # renders the dataflow diagram
+brew "ffmpeg"                # converts the screen recording to an inline GIF
 #+end_src
 
 (Emacs also needs =clojure-mode= for the tangle's =:comments link= breadcrumbs:
@@ -94,7 +101,20 @@ The =tangle= task runs batch Emacs, which skips init files — hence the explici
         {:git/url "https://github.com/burinc/glitter-uikit"
          :git/sha "ce2eda922575c2c8040226cb8735dc5697f2084f"}
         ;; NOT transitive under jolt (org.clojure/clojure is terminal) — see prose.
-        org.clojure/spec.alpha {:mvn/version "0.5.238"}}
+        org.clojure/spec.alpha {:mvn/version "0.5.238"}
+        ;; clj-http-lite over jolt host shims (BSD sockets + OpenSSL via jolt.ffi
+        ;; — no JVM); the Live Currency example fetches ECB rates with it.
+        jolt-lang/http-client
+        {:git/url "https://github.com/jolt-lang/http-client"
+         :git/sha "04825632ed96a77a1c6ba1921c0a31280a3daade"}
+        ;; Pure-Clojure JSON, and the host API it needs under jolt: data.json's
+        ;; date writers use java.time.format.DateTimeFormatter, which RFC 0008
+        ;; moves out of jolt core into jolt-lang/time — jolt's load error says
+        ;; exactly this, by name, when the dep is missing.
+        org.clojure/data.json {:mvn/version "2.5.1"}
+        io.github.jolt-lang/time
+        {:git/url "https://github.com/jolt-lang/time"
+         :git/sha "790b040a80dcca6cf853475e2a8feb802fb1b14b"}}
 
  :aliases {:demo {:main-opts ["-m" "demo.core"]}}
 
@@ -107,7 +127,10 @@ The =tangle= task runs batch Emacs, which skips init files — hence the explici
          ;; IS the bundle executable (see The launcher dissolves).
          bundle "mkdir -p Demo.app/Contents/MacOS && jolt build -m demo.core -o Demo.app/Contents/MacOS/demo && rm -rf Demo.app/Contents/MacOS/demo.build"
          app    "open Demo.app"
-         diagram "dot -Tsvg dataflow.dot -o dataflow.svg"}}
+         diagram "dot -Tsvg dataflow.dot -o dataflow.svg"
+         ;; GitHub won't inline-play a .mov inside an org file, so the gallery
+         ;; embeds a GIF. Palette-based single pass keeps the colors clean.
+         media  "ffmpeg -y -i media/live-fx.mov -vf 'fps=12,scale=720:-1:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse' media/live-fx.gif"}}
 #+end_src
 
 * Namespace
@@ -131,6 +154,7 @@ adding an example to the app is adding one line here.
               [demo.registry :as reg]
               [demo.examples.counter]
               [demo.examples.currency]
+              [demo.examples.fx]
               [demo.examples.particles]
               [glitter-uikit.app :as app]
               [glitter-uikit.appkit :as appkit]
@@ -176,7 +200,9 @@ conforms before any window exists).
 (s/def ::state some?)          ; a derefable state atom (no portable Atom class check)
 (s/def ::width pos-int?)
 (s/def ::height pos-int?)
-(s/def ::example (s/keys :req-un [::id ::title ::view ::state ::width ::height]))
+(s/def ::on-open fn?)   ; optional: runs on every open/reopen of the window
+(s/def ::example (s/keys :req-un [::id ::title ::view ::state ::width ::height]
+                         :opt-un [::on-open]))
 
 (defonce examples (atom []))
 
@@ -271,11 +297,19 @@ render.
 
 #+begin_src clojure :tangle src/demo/core.clj :comments link
 (defn hub-view [_state]
-  (into [:vbox {:spacing 8}
-         [:label {:label "glitter-uikit examples"}]]
+  (into [:vbox {:spacing 8 :margin 16}
+         [:label {:markup [:span {:size "large" :weight "bold"} "glitter-uikit examples"]}]
+         [:label {:markup [:span {:size "small" :foreground "#8e939d"}
+                           "Each example opens in its own window."]}]]
         (for [{:keys [id title]} @reg/examples]
           [:button {:label title :on {:click [[:action/open-example id]]}}])))
 #+end_src
+
+Polish notes, used everywhere from here on: boxes take =:margin= (edge insets
+on the =NSStackView=), and labels take =:markup= — Pango-style hiccup
+(=[:span {:size "large" :weight "bold"} ...]=) validated against Pango's
+vocabulary and rendered to an =NSAttributedString=, with muted grays via
+=:foreground=.
 
 * Actions
 
@@ -642,10 +676,11 @@ is to open at the pointer instead:
 (defonce ^:private prefs-window (atom nil))
 
 (defn prefs-view [{:keys [bg]}]
-  [:vbox {:spacing 10}
-   [:label {:label "Background color"}]
-   [:label {:label (if bg (pr-str (mapv #(/ (int (* 100 %)) 100.0) bg))
-                       "system default")}]
+  [:vbox {:spacing 10 :margin 16}
+   [:label {:markup [:span {:weight "bold"} "Background color"]}]
+   [:label {:markup [:span {:foreground "#8e939d"}
+                     (if bg (pr-str (mapv #(/ (int (* 100 %)) 100.0) bg))
+                         "system default")]}]
    [:button {:label "Choose…" :on {:click [[:action/pick-bg]]}}]])
 
 (defn show-preferences! []
@@ -747,16 +782,20 @@ its own watch on its own atom).
   (s/cat :kind #{:action/open-example} :id keyword?))
 
 (defmethod reg/run-action! :action/open-example [_ [_ id]]
-  (if-let [win (@example-windows id)]
-    (u/window-show! win)
-    (when-let [{:keys [title view state width height]}
-               (first (filter #(= id (:id %)) @reg/examples))]
-      (let [win (u/window-new title width height)]
-        (u/objc-msg-send-1intvoid win (u/sel "setReleasedWhenClosed:") 0)
-        (mount-second! win view state (keyword "demo.example" (name id)))
-        (swap! example-windows assoc id win)
-        (place-near-pointer! win)
-        (u/window-show! win)))))
+  (let [{:keys [title view state width height on-open] :as ex}
+        (first (filter #(= id (:id %)) @reg/examples))]
+    (when ex
+      (if-let [win (@example-windows id)]
+        (u/window-show! win)
+        (let [win (u/window-new title width height)]
+          (u/objc-msg-send-1intvoid win (u/sel "setReleasedWhenClosed:") 0)
+          (mount-second! win view state (keyword "demo.example" (name id)))
+          (swap! example-windows assoc id win)
+          (place-near-pointer! win)
+          (u/window-show! win)))
+      ;; :on-open runs on every open AND reopen — Live Currency uses it to
+      ;; fetch fresh rates each time its window comes forward.
+      (when on-open (on-open)))))
 #+end_src
 
 Early versions centered every window — and since the hub centers too, each new
@@ -976,6 +1015,39 @@ above is untangled but kept — it documents why the executable must be Mach-O,
 and ten lines of =_NSGetExecutablePath= / =chdir= / =execlp= is the shape of
 the fallback if a bundle ever needs to launch something it can't link in.
 
+* Gallery
+
+The hub — every button derived from the example registry:
+
+#+caption: The hub window.
+[[file:media/hub.png]]
+
+The counter, first of the examples and the template for the rest
+([[file:examples/counter/README.org][notebook]]):
+
+#+caption: The Counter example.
+[[file:media/counter.png]]
+
+The /Learning Cocoa/ Currency Converter, faithful to the 2001 original
+([[file:examples/currency/README.org][notebook]]):
+
+#+caption: The Currency Converter example.
+[[file:media/currency-converter.png]]
+
+Live Currency — drop-downs, a fiber-parked HTTPS fetch of ECB rates, and the
+conversion done for you ([[file:examples/fx/README.org][notebook]]), in motion — the GIF is generated from
+[[file:media/live-fx.mov][the original recording]] by the =media= task (=jolt media=), since GitHub
+inline-plays GIFs in an org file but not =.mov=​s:
+
+#+caption: Live Currency fetching rates as the currencies change.
+[[file:media/live-fx.gif]]
+
+#+caption: Live Currency converting USD to EUR.
+[[file:media/fx-usd-eur.png]]
+
+#+caption: Same window a moment later — new pair fetched, USD to GBP.
+[[file:media/fx-usd-gbp.png]]
+
 * References
 
 The lineage and the sources this notebook leans on — kept here so readers can
@@ -1002,6 +1074,11 @@ follow the same trail.
 - [[https://leanpub.com/fp-oo][Brian Marick, /Functional Programming for the Object-Oriented Programmer/]]
   — the spirit of the Currency Converter port: familiar OO ceremony,
   re-expressed until it dissolves.
+- [[https://guide.clojure.style/][The Clojure Style Guide]] — the community idiom baseline; it's what
+  prompted trading =future= for =core.async/io-thread= in Live Currency, which
+  led straight to jolt's fiber runtime (=jolt.fibers=, =host/chez/fibers.ss=:
+  go blocks and =io-thread= bodies park on Chez continuations instead of
+  holding OS threads).
 - [[http://www.literateprogramming.com/knuthweb.pdf][Knuth, /Literate Programming/ (1984)]] — why this file is the program.
 
 *The platform*
@@ -1015,6 +1092,13 @@ follow the same trail.
 
 *The tooling*
 
+- [[https://github.com/jolt-lang/http-client][jolt-lang/http-client]] — [[https://github.com/clj-commons/clj-http-lite][clj-http-lite]] running on jolt host shims: BSD
+  sockets, libz, and OpenSSL through =jolt.ffi=, no JVM anywhere.
+- [[https://frankfurter.dev][Frankfurter]] — keyless exchange-rate API over ECB reference rates; the
+  Live Currency example's data source.
+- [[https://github.com/clojure/data.json][clojure/data.json]] — pure-Clojure JSON; runs under jolt once
+  [[https://github.com/jolt-lang/time][jolt-lang/time]] supplies =java.time= ([[https://jolt-lang.github.io/docs/rfc/0008][RFC 0008]] moves it out of core, and
+  the load error names the missing dep itself).
 - [[https://orgmode.org/manual/Extracting-Source-Code.html][Org manual: Extracting Source Code]] — tangling, =:comments link=,
   =org-babel-detangle=.
 - [[https://docs.brew.sh/Brewfile-and-brew-bundle][Homebrew Bundle]] — the Brewfile format.
