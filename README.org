@@ -9,12 +9,22 @@ A literate demo of [[https://github.com/burinc/glitter-uikit][glitter-uikit]] �
 model, if you come from the web: glitter is the reconciler, AppKit is the DOM.
 Hiccup in, real =NSButton=​s out.
 
-You'll need Emacs to tangle the code and GTK4 for FFI:
+The toolchain installs from a Brewfile — tangled from this document, of
+course — with =brew bundle --file=./Brewfile= (explicit on purpose: anyone
+with =HOMEBREW_BUNDLE_FILE= pointing at a global Brewfile would otherwise
+install that one instead):
 
-#+begin_src sh
-brew install gtk4
-brew install emacs
+#+begin_src ruby :tangle Brewfile :comments link
+tap  "jolt-lang/jolt"
+brew "jolt-lang/jolt/jolt"   # the jolt runtime/compiler
+brew "gtk4"                  # required transitively by glitter's :jolt/native (see Dependencies)
+brew "emacs"                 # tangles this document
+brew "graphviz"              # renders the dataflow diagram
 #+end_src
+
+(Emacs also needs =clojure-mode= for the tangle's =:comments link= breadcrumbs:
+=M-x package-install RET clojure-mode= once, from any Emacs — it lands in
+=~/.emacs.d/elpa=, where the batch tangle's =package-initialize= finds it.)
 
 This Org file is the source of truth for the whole project. Every code block
 below tangles into =deps.edn= or =src/demo/core.clj=:
@@ -75,7 +85,8 @@ The =tangle= task runs batch Emacs, which skips init files — hence the explici
          ;; jolt build AOT-compiles the app into a self-contained Mach-O that
          ;; IS the bundle executable (see The launcher dissolves).
          bundle "mkdir -p Demo.app/Contents/MacOS && jolt build -m demo.core -o Demo.app/Contents/MacOS/demo && rm -rf Demo.app/Contents/MacOS/demo.build"
-         app    "open Demo.app"}}
+         app    "open Demo.app"
+         diagram "dot -Tsvg dataflow.dot -o dataflow.svg"}}
 #+end_src
 
 * Namespace
@@ -96,6 +107,7 @@ menu-bar section below can bind a few CoreFoundation functions that
               [glitter-uikit.appkit :as appkit]
               [glitter-uikit.ffi :as u]
               [glitter-uikit.widget :as w]
+              [glitter.alias :as alias]
               [glitter.core :as core]
               [jolt.ffi :as ffi]))
 #+end_src
@@ -107,8 +119,12 @@ and every =swap!= re-reconciles the view (marshalled onto the AppKit main
 thread by the renderer, so it's safe to swap from anywhere — an nREPL eval
 included).
 
+=:bg= is the one preference: the main window's background color as an sRGB
+=[r g b a]= vector, =nil= meaning "system default". Plain data, so it specs,
+prints, and diffs like everything else.
+
 #+begin_src clojure :tangle src/demo/core.clj :comments link
-(defonce state (atom {:count 0}))
+(defonce state (atom {:count 0 :bg nil}))
 #+end_src
 
 * View
@@ -140,19 +156,33 @@ and the dispatcher checks the batch before interpreting it. A typo'd action in
 some =:on {:click ...}= prints an =explain= instead of being silently swallowed
 by the =case= default — the counter still works, but the mistake is loud.
 
+The =s/cat= promise gets kept below: =:action/set-bg= is the first action that
+carries an argument, so =::action= splits into a nullary branch and per-kind
+argument branches. The dispatcher also grew two /effectful/ actions for the
+preferences flow (=:action/pick-bg= opens the color panel; the panel's own
+changes come back through =:action/set-bg=) — =declare='d here, defined in the
+Preferences section.
+
 #+begin_src clojure :tangle src/demo/core.clj :comments link
-(s/def ::action-kind #{:action/inc :action/dec :action/reset})
-(s/def ::action (s/cat :kind ::action-kind))
+(declare open-color-panel!)
+
+(s/def ::rgba (s/coll-of number? :count 4))
+(s/def ::action
+  (s/or :nullary (s/cat :kind #{:action/inc :action/dec :action/reset
+                                :action/pick-bg})
+        :set-bg  (s/cat :kind #{:action/set-bg} :color ::rgba)))
 (s/def ::actions (s/coll-of ::action))
 
 (defn execute-actions [_event actions]
   (when-not (s/valid? ::actions actions)
     (println "Invalid actions:" (s/explain-str ::actions actions)))
-  (doseq [[kind] actions]
+  (doseq [[kind arg] actions]
     (case kind
       :action/dec (swap! state update :count dec)
       :action/inc (swap! state update :count inc)
       :action/reset (swap! state assoc :count 0)
+      :action/pick-bg (open-color-panel!)
+      :action/set-bg (swap! state assoc :bg arg)
       nil)))
 
 (core/set-dispatch! execute-actions)
@@ -334,13 +364,15 @@ before the data-driven version below abstracted it. Superseded, not wrong:
     (u/objc-msg-send-1pvoid menubar (u/sel "addItem:") app-item)
     (u/objc-msg-send-1pvoid (u/shared-application) (u/sel "setMainMenu:") menubar)))
 
+(declare show-preferences!)  ; defined in the Preferences section below
+
 (defn app-menu-items
   "The standard Mac app menu, as data."
   [app-name]
   [{:title (str "About " app-name) :action "orderFrontStandardAboutPanel:"}
    :separator
    {:title "Preferences…" :key ","
-    :handler (fn [] (println "Preferences: nothing to configure yet"))}
+    :handler (fn [] (show-preferences!))}
    :separator
    {:title (str "Hide " app-name) :action "hide:" :key "h"}
    {:title "Hide Others" :action "hideOtherApplications:" :key "h"
@@ -349,6 +381,176 @@ before the data-driven version below abstracted it. Superseded, not wrong:
    :separator
    {:title (str "Quit " app-name) :action "terminate:" :key "q"}])
 #+end_src
+
+* Preferences
+
+A second window, one preference: the main window's background color, picked
+with the shared =NSColorPanel= and stored in =state= as plain data alongside
+=:count=.
+
+Mounting a second window surfaced a real trap. =appkit/mount!= watches the
+state atom with a /hardcoded/ key (=::appkit/render=), and Clojure's
+=add-watch= is last-writer-wins per key — so a second =mount!= on the same
+atom silently *replaces* the first window's re-render watch, and the main
+window goes still. Watch keys are identities. =mount-second!= is =mount!='s
+wiring verbatim, with the key as a parameter:
+
+#+begin_src clojure :tangle src/demo/core.clj :comments link
+(defn mount-second!
+  "appkit/mount! hardcodes its add-watch key, so a second mount! on the same
+  atom would replace the first window's re-render watch. Identical wiring,
+  caller-supplied key."
+  [window view state-atom watch-key]
+  (let [r (appkit/renderer)
+        root-el (atom {:tag :window :view window :children [] :handlers {}})
+        vdom (atom nil)
+        render! (fn [st]
+                  (reset! vdom (:vdom (core/reconcile r root-el (view st) @vdom
+                                                      {:aliases (alias/get-registered-aliases)}))))]
+    (render! @state-atom)
+    (add-watch state-atom watch-key (fn [_ _ _ st] (app/on-gui (fn [] (render! st)))))
+    nil))
+#+end_src
+
+Colors cross the FFI in both directions. Reading: a panel's color can live in
+any colorspace (catalog colors included), so convert to sRGB before pulling
+components. Writing: =colorWithSRGBRed:green:blue:alpha:= is four doubles —
+the exact shape =objc-msg-send-4d= already binds.
+
+#+begin_src clojure :tangle src/demo/core.clj :comments link
+(defn- nscolor->rgba [c]
+  (let [srgb (u/objc-msg-send-1p c (u/sel "colorUsingColorSpace:")
+                                 (u/objc-msg-send-0 (u/cls "NSColorSpace")
+                                                    (u/sel "sRGBColorSpace")))]
+    (when-not (ffi/null? srgb)
+      [(u/objc-msg-send-0d srgb (u/sel "redComponent"))
+       (u/objc-msg-send-0d srgb (u/sel "greenComponent"))
+       (u/objc-msg-send-0d srgb (u/sel "blueComponent"))
+       (u/objc-msg-send-0d srgb (u/sel "alphaComponent"))])))
+
+(defn- rgba->nscolor [[r g b a]]
+  (u/objc-msg-send-4d (u/cls "NSColor")
+                      (u/sel "colorWithSRGBRed:green:blue:alpha:") r g b a))
+#+end_src
+
+The shared color panel is one more citizen of the =fire:= registry — target
+=w/invoker=, handler keyed by the panel pointer. =setContinuous:= makes it
+fire while dragging, and every change routes through the normal action
+pipeline as =[[:action/set-bg [r g b a]]]= — the panel never touches state
+directly.
+
+#+begin_src clojure :tangle src/demo/core.clj :comments link
+(defn open-color-panel!
+  "Order front the shared NSColorPanel, wired to dispatch :action/set-bg
+  continuously as the color changes."
+  []
+  (let [panel (u/objc-msg-send-0 (u/cls "NSColorPanel") (u/sel "sharedColorPanel"))]
+    (swap! w/actions assoc-in [panel :click]
+           (fn [sender]
+             (when-let [rgba (nscolor->rgba (u/objc-msg-send-0 sender (u/sel "color")))]
+               (execute-actions nil [[:action/set-bg rgba]]))))
+    (u/objc-msg-send-1intvoid panel (u/sel "setContinuous:") 1)
+    (u/objc-msg-send-1pvoid panel (u/sel "setTarget:") w/invoker)
+    (u/objc-msg-send-1pvoid panel (u/sel "setAction:") (u/sel "fire:"))
+    (u/objc-msg-send-1pvoid panel (u/sel "makeKeyAndOrderFront:") ffi/null)))
+#+end_src
+
+The window itself: created lazily once, then reused. Two AppKit details —
+=setReleasedWhenClosed:NO=, because a titled NSWindow defaults to
+self-releasing on close and our cached pointer would dangle on reopen; and the
+prefs view is ordinary hiccup on the SAME state atom, so the swatch label
+re-renders live as the panel drags.
+
+#+begin_src clojure :tangle src/demo/core.clj :comments link
+(defonce ^:private prefs-window (atom nil))
+
+(defn prefs-view [{:keys [bg]}]
+  [:vbox {:spacing 10}
+   [:label {:label "Background color"}]
+   [:label {:label (if bg (pr-str (mapv #(/ (int (* 100 %)) 100.0) bg))
+                       "system default")}]
+   [:button {:label "Choose…" :on {:click [[:action/pick-bg]]}}]])
+
+(defn show-preferences! []
+  (if-let [win @prefs-window]
+    (u/window-show! win)
+    (let [win (u/window-new "Preferences" 280 140)]
+      (u/objc-msg-send-1intvoid win (u/sel "setReleasedWhenClosed:") 0)
+      (mount-second! win prefs-view state ::prefs-render)
+      (reset! prefs-window win)
+      (u/window-center! win)
+      (u/window-show! win))))
+#+end_src
+
+Applying the preference is a third, separately keyed watch on the same atom —
+the reconciler owns the content view, but the window's =backgroundColor= is
+chrome, ours to set directly:
+
+#+begin_src clojure :tangle src/demo/core.clj :comments link
+(defn watch-background!
+  "Apply :bg to `window` now and on every state change (no-op while nil)."
+  [window state-atom]
+  (let [apply! (fn [{:keys [bg]}]
+                 (when bg
+                   (u/objc-msg-send-1pvoid window (u/sel "setBackgroundColor:")
+                                           (rgba->nscolor bg))))]
+    (apply! @state-atom)
+    (add-watch state-atom ::apply-bg (fn [_ _ _ st] (app/on-gui (fn [] (apply! st)))))))
+#+end_src
+
+** Dataflow
+
+The whole loop, as a picture. Graphviz over Mermaid for a reason worth
+recording: GitHub renders Mermaid only inside /markdown/ fences — an Org file
+gets no such treatment — and org-babel's Mermaid support needs a third-party
+package plus the Node CLI. A =dot= block, though, plays the same game as
+everything else here: it /tangles/ to =dataflow.dot=, the =diagram= task
+renders =dataflow.svg=, and the Org file embeds the image, which GitHub and
+Emacs both display. The loop grows one link: =jolt tangle && jolt diagram=.
+
+#+begin_src dot :tangle dataflow.dot
+digraph dataflow {
+  rankdir=TB;
+  fontname="Helvetica";
+  node [shape=box, style=rounded, fontname="Helvetica", fontsize=11];
+  edge [fontname="Helvetica", fontsize=9];
+
+  subgraph cluster_views {
+    label="hiccup views (reconciled)";
+    style=dashed;
+    main  [label="counter view\n(main window)"];
+    prefs [label="prefs-view\n(Preferences window)"];
+  }
+
+  subgraph cluster_chrome {
+    label="AppKit chrome (ours, not reconciled)";
+    style=dashed;
+    menu  [label="app menu\nPreferences… (cmd-,)"];
+    panel [label="NSColorPanel\n(continuous)"];
+    bg    [label="main window\nbackgroundColor"];
+  }
+
+  dispatch [label="execute-actions\n(s/valid? gate)", style="rounded,bold"];
+  state    [label="state\n{:count n, :bg [r g b a]}", shape=ellipse, style=bold];
+
+  // data in: every mutation is an action vector
+  main  -> dispatch [label="[[:action/inc]] etc."];
+  prefs -> dispatch [label="[[:action/pick-bg]]"];
+  panel -> dispatch [label="[[:action/set-bg [r g b a]]]"];
+
+  // effects: the two places a handler touches AppKit directly
+  menu     -> prefs [label="show-preferences!", style=dashed];
+  dispatch -> panel [label="open-color-panel!", style=dashed];
+
+  // the single write, fanning out through three independently-keyed watches
+  dispatch -> state [label="swap!"];
+  state -> main  [label="::render"];
+  state -> prefs [label="::prefs-render"];
+  state -> bg    [label="::apply-bg"];
+}
+#+end_src
+
+[[file:dataflow.svg]]
 
 * Main
 
@@ -369,6 +571,7 @@ re-reconciles the content view.
       (make-main-menu! "Demo" (app-menu-items "Demo"))
       (u/objc-msg-send-1intvoid window (u/sel "setTitlebarAppearsTransparent:") 1)
       ;; (add-titlebar-button! window "Reset" (fn [] (reset! state {:count 0})))
+      (watch-background! window state)
       (appkit/mount! window view state))
     :title "Demo"
     :width 300
