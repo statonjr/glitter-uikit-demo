@@ -4,8 +4,8 @@
 
 * Introduction
 
-A literate demo of [[https://github.com/burinc/glitter-uikit][glitter-uikit]] — the native macOS (AppKit) renderer for
-[[https://github.com/burinc/glitter][glitter]], a Replicant-style reconciler for Clojure (well, [[https://github.com/jolt-lang/jolt][Jolt]]). The mental
+A literate demo of [[https://github.com/jlt-commons/glitter-uikit][glitter-uikit]] — the native macOS (AppKit) renderer for
+[[https://github.com/jlt-commons/glitter][glitter]], a Replicant-style reconciler for Clojure (well, [[https://github.com/jolt-lang/jolt][Jolt]]). The mental
 model, if you come from the web: glitter is the reconciler, AppKit is the DOM.
 Hiccup in, real =NSButton=​s out.
 
@@ -92,21 +92,32 @@ The =tangle= task runs batch Emacs, which skips init files — hence the explici
 (=:comments link= needs it to know Clojure's comment syntax).
 
 #+begin_src clojure :tangle deps.edn :comments link
-{:paths ["src"]
+{;; ffi/write took (p t offset v) before jolt 0.8.0 and (p t v offset) after,
+ ;; and the two cannot be told apart at runtime — so an older jolt must
+ ;; refuse, not guess (see "jolt 0.8.0: the write order"). glitter-uikit and
+ ;; http-client declare the same floor.
+ :jolt/min-version "0.8.0"
+ :paths ["src"]
 
- :deps {io.github.burinc/glitter
-        {:git/url "https://github.com/burinc/glitter"
+ ;; burinc → jlt-commons: both repos moved, and glitter-uikit now pins glitter
+ ;; under the jlt-commons name — rule 1's override only works when the
+ ;; coordinate NAMES match, so ours are renamed to match.
+ :deps {io.github.jlt-commons/glitter
+        {:git/url "https://github.com/jlt-commons/glitter"
          :git/sha "33713d607d11cc1fbf8cda237c0b6f251ac43388"}
-        io.github.burinc/glitter-uikit
-        {:git/url "https://github.com/burinc/glitter-uikit"
-         :git/sha "ce2eda922575c2c8040226cb8735dc5697f2084f"}
+        ;; 48f793b: ffi/write's value before the offset (jolt 0.8.0), plus CI/docs.
+        io.github.jlt-commons/glitter-uikit
+        {:git/url "https://github.com/jlt-commons/glitter-uikit"
+         :git/sha "48f793be6f09fe093497108a7c013d1d3586ef37"}
         ;; NOT transitive under jolt (org.clojure/clojure is terminal) — see prose.
         org.clojure/spec.alpha {:mvn/version "0.5.238"}
         ;; clj-http-lite over jolt host shims (BSD sockets + OpenSSL via jolt.ffi
         ;; — no JVM); the Live Currency example fetches ECB rates with it.
+        ;; 177b1ce: ffi/write's value before the offset (jolt 0.8.0); nothing
+        ;; else changed in src/.
         jolt-lang/http-client
         {:git/url "https://github.com/jolt-lang/http-client"
-         :git/sha "04825632ed96a77a1c6ba1921c0a31280a3daade"}
+         :git/sha "177b1ce4e529ffe052e6a1b7b103ed924de535f6"}
         ;; Pure-Clojure JSON, and the host API it needs under jolt: data.json's
         ;; date writers use java.time.format.DateTimeFormatter, which RFC 0008
         ;; moves out of jolt core into jolt-lang/time — jolt's load error says
@@ -1016,6 +1027,75 @@ above is untangled but kept — it documents why the executable must be Mach-O,
 and ten lines of =_NSGetExecutablePath= / =chdir= / =execlp= is the shape of
 the fallback if a bundle ever needs to launch something it can't link in.
 
+* jolt 0.8.0: the write order (2026-09-01)
+
+[[https://github.com/jolt-lang/jolt/blob/main/CHANGELOG.md#080---2026-08-31][jolt 0.8.0]] makes =jolt.ffi= name-for-name compatible with =babashka.ffi=, and
+two of its changes break: =ffi/write= now takes the value /before/ the offset
+— =(write p t v offset)=, where 0.7.x took =(write p t offset v)= — and a fixed
+array in a layout is =[:array type count]= rather than =[:array count type]=.
+The array one raises at compile time. The write one cannot: an offset and a
+value are both integers, so an old call site on the new runtime writes the
+wrong thing to the wrong place and says nothing.
+
+This notebook's own FFI is three =defcfn= bindings (the =CFBundle*= trio in
+[[*Menu bar][Menu bar]]) and =ffi/null= — nothing to change. Its dependencies were another
+story. Every pinned git dep in =~/.jolt/gitlibs= was audited for the two
+shapes, and the result on 0.8.0 with the /old/ pins:
+
+- *glitter-uikit* @ ce2eda9 — =app.clj='s scheduler builds
+  =CFRunLoopSourceContext= as nine zeroed offsets and a =perform= at 72, old
+  order. On 0.8.0, =(ffi/write ctx :pointer 72 perform)= reads as "write 72 at
+  offset /perform/" — a function pointer as a byte offset — and
+  =jolt -e "(require 'demo.core)"= dies at load with =invalid memory reference=
+  at =app.clj:30=. The demo did not start.
+- *jolt-lang/http-client* @ 0482563 — =net.clj= and =zlib.clj= fill =addrinfo=
+  hints, =pollfd=, =timeval= and =z_stream= by offset, old order. The hints
+  struct gets =ai_socktype= written into the wrong bytes, =getaddrinfo= fails,
+  and =(http/get "https://api.frankfurter.app/…")= throws from
+  =jolt.http.net/conn-ex= before a socket opens. Live Currency would say "Rate
+  fetch failed" forever.
+- *glitter* @ 33713d6 — its =glitter.ffi= is GTK, never loaded here
+  (=glitter.core= doesn't require it), and carries no raw writes anyway.
+  Unchanged.
+- *jolt-crypto* @ 0adae49 (transitive, via http-client) — two old-order writes
+  in its DER encode/decode path; http-client takes only =SecureRandom= from it,
+  so that path is not on this demo's. Upstream fixed it the same day (8071f4b)
+  but http-client's HEAD still pins 0adae49. Left alone; noted.
+
+Upstream had already fixed both — "Move ffi/write's value argument before the
+offset", 2026-08-31, one commit per repo — so the change here is two pin bumps,
+not a fork: *glitter-uikit* → 48f793b (the fix plus CI and docs; =app.clj= is
+the only source file touched), *http-client* → 177b1ce (the fix; nothing else
+in =src/=). Both carry =:jolt/min-version "0.8.0"= now, and so does this
+=deps.edn=: the old and new spellings can't be told apart at runtime, so an
+older jolt must refuse rather than guess. (The floor bites only from 0.8.0 on
+— an older runtime ignores a key it doesn't know — so it guards the /next/
+break; what guards this one is the pins.)
+
+One rename rode along. Both repos moved from =burinc= to the =jlt-commons= org
+(GitHub redirects, so the old URLs still resolved), and glitter-uikit's own
+=deps.edn= now pins glitter as =io.github.jlt-commons/glitter=. Rule 1 of
+[[*Dependencies][Dependencies]] — our pin overrides the transitive one — holds only when the
+coordinate /name/ matches, so a stale =io.github.burinc/glitter= here would
+have resolved a second copy of glitter beside glitter-uikit's rather than
+overriding it. The coordinates are renamed to match; =jolt -Stree= now shows
+glitter-uikit's glitter as =:use-top=, which is rule 1 working.
+
+Verified on 0.8.0 after the bump: the headless load prints all four example
+ids; =(http/get …frankfurter…)= answers 200 with a rate; and a scripted
+=app/run= with =:auto-quit-ms= mounts the hub, drains a thunk posted through
+the CFRunLoopSource scheduler (the exact path the old order corrupted), opens
+Live Currency, and watches its state go =:loading= → =:ok= with a rate in
+~350 ms — three times over, as the currency changed. =jolt demo= is the same
+code without the timer.
+
+(Two environmental notes from the same session. =gtk4= was not installed on
+this machine — glitter's transitive =:jolt/native= hard-fails before any
+namespace loads without it, exactly as [[*Dependencies][Dependencies]] warns — so
+=brew install gtk4= came first; the Brewfile already lists it. And the tangle
+writes =deps.edn=, =src/=, =Demo.app/= and =dataflow.dot=, none of which
+=.gitignore= covers, so a fresh tangle shows them as untracked.)
+
 * Gallery
 
 The hub — every button derived from the example registry:
@@ -1058,10 +1138,10 @@ follow the same trail.
 
 - [[https://github.com/jolt-lang/jolt][jolt]] — native Clojure on Chez Scheme; [[https://jolt-lang.github.io/docs/building-and-deps.html][Building & Running]] covers
   =jolt build='s AOT compilation (how our =.app= executable is made).
-- [[https://github.com/burinc/glitter][glitter]] — the Replicant-style reconciler; owns =glitter.core= and the
+- [[https://github.com/jlt-commons/glitter][glitter]] — the Replicant-style reconciler; owns =glitter.core= and the
   IRender/IMemory renderer seam.
-- [[https://github.com/burinc/glitter-uikit][glitter-uikit]] — the AppKit renderer this demo drives. Its
-  [[https://github.com/burinc/glitter-uikit/blob/main/src/glitter_uikit/ffi.clj][ffi.clj]] docstring is the best short course on calling =objc_msgSend= from
+- [[https://github.com/jlt-commons/glitter-uikit][glitter-uikit]] — the AppKit renderer this demo drives. Its
+  [[https://github.com/jlt-commons/glitter-uikit/blob/main/src/glitter_uikit/ffi.clj][ffi.clj]] docstring is the best short course on calling =objc_msgSend= from
   a C FFI (fixed-arity bindings, structs flattened per the arm64 HFA rule).
 
 *The ideas*
